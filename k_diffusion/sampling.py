@@ -596,12 +596,22 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
             callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
         h = t_next - t
+        
+        t_min = min(sigma_fn(t_next), sigma_fn(t))
+        t_max = max(sigma_fn(t_next), sigma_fn(t))
+
         if old_denoised is None or sigmas[i + 1] == 0:
-            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+            x = (t_min / t_max) * x - (-h).expm1() * denoised
         else:
             h_last = t - t_fn(sigmas[i - 1])
-            r = h_last / h
+
+            h_min = min(h_last, h)
+            h_max = max(h_last, h)
+            r = h_max / h_min
+
+            h_d = (h_max + h_min) / 2
             denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
-            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+            x = (t_min / t_max) * x - (-h_d).expm1() * denoised_d
+
         old_denoised = denoised
     return x
