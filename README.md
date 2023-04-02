@@ -1,3 +1,12 @@
+# THIS IS A FORK
+
+Forked from https://github.com/crowsonkb/k-diffusion
+
+Changes:
+
+1. Add DPM++ 2M sampling fix by @hallatore https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/8457
+2. Add MPS fix for MacOS by @brkirch https://github.com/brkirch/k-diffusion
+
 # k-diffusion
 
 An implementation of [Elucidating the Design Space of Diffusion-Based Generative Models](https://arxiv.org/abs/2206.00364) (Karras et al., 2022) for PyTorch. The patching method in [Improving Diffusion Model Efficiency Through Patching](https://arxiv.org/abs/2207.04316) is implemented as well.
