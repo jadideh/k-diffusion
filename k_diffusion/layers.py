@@ -1,5 +1,7 @@
+from functools import lru_cache, reduce
 import math
 
+from dctorch import functional as df
 from einops import rearrange, repeat
 import torch
 from torch import nn
@@ -7,15 +9,63 @@ from torch.nn import functional as F
 
 from . import sampling, utils
 
+
+# Helper functions
+
+
+def dct(x):
+    if x.ndim == 3:
+        return df.dct(x)
+    if x.ndim == 4:
+        return df.dct2(x)
+    if x.ndim == 5:
+        return df.dct3(x)
+    raise ValueError(f'Unsupported dimensionality {x.ndim}')
+
+
+@lru_cache
+def freq_weight_1d(n, scales=0, dtype=None, device=None):
+    ramp = torch.linspace(0.5 / n, 0.5, n, dtype=dtype, device=device)
+    weights = -torch.log2(ramp)
+    if scales >= 1:
+        weights = torch.clamp_max(weights, scales)
+    return weights
+
+
+@lru_cache
+def freq_weight_nd(shape, scales=0, dtype=None, device=None):
+    indexers = [[slice(None) if i == j else None for j in range(len(shape))] for i in range(len(shape))]
+    weights = [freq_weight_1d(n, scales, dtype, device)[ix] for n, ix in zip(shape, indexers)]
+    return reduce(torch.minimum, weights)
+
+
 # Karras et al. preconditioned denoiser
+
 
 class Denoiser(nn.Module):
     """A Karras et al. preconditioner for denoising diffusion models."""
 
-    def __init__(self, inner_model, sigma_data=1.):
+    def __init__(self, inner_model, sigma_data=1., weighting='karras', scales=1):
         super().__init__()
         self.inner_model = inner_model
         self.sigma_data = sigma_data
+        self.scales = scales
+        if callable(weighting):
+            self.weighting = weighting
+        if weighting == 'karras':
+            self.weighting = torch.ones_like
+        elif weighting == 'soft-min-snr':
+            self.weighting = self._weighting_soft_min_snr
+        elif weighting == 'snr':
+            self.weighting = self._weighting_snr
+        else:
+            raise ValueError(f'Unknown weighting type {weighting}')
+
+    def _weighting_soft_min_snr(self, sigma):
+        return (sigma * self.sigma_data) ** 2 / (sigma ** 2 + self.sigma_data ** 2) ** 2
+
+    def _weighting_snr(self, sigma):
+        return self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
 
     def get_scalings(self, sigma):
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
@@ -25,10 +75,15 @@ class Denoiser(nn.Module):
 
     def loss(self, input, noise, sigma, **kwargs):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
+        c_weight = self.weighting(sigma)
         noised_input = input + noise * utils.append_dims(sigma, input.ndim)
         model_output = self.inner_model(noised_input * c_in, sigma, **kwargs)
         target = (input - c_skip * noised_input) / c_out
-        return (model_output - target).pow(2).flatten(1).mean(1)
+        if self.scales == 1:
+            return ((model_output - target) ** 2).flatten(1).mean(1) * c_weight
+        sq_error = dct(model_output - target) ** 2
+        f_weight = freq_weight_nd(sq_error.shape[2:], self.scales, dtype=sq_error.dtype, device=sq_error.device)
+        return (sq_error * f_weight).flatten(1).mean(1) * c_weight
 
     def forward(self, input, sigma, **kwargs):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
@@ -111,6 +166,8 @@ class AdaGN(ConditionedModule):
         self.eps = eps
         self.cond_key = cond_key
         self.mapper = nn.Linear(feats_in, c_out * 2)
+        nn.init.zeros_(self.mapper.weight)
+        nn.init.zeros_(self.mapper.bias)
 
     def forward(self, input, cond):
         weight, bias = self.mapper(cond[self.cond_key]).chunk(2, dim=-1)
@@ -119,6 +176,7 @@ class AdaGN(ConditionedModule):
 
 
 # Attention
+
 
 class SelfAttention2d(ConditionedModule):
     def __init__(self, c_in, n_head, norm, dropout_rate=0.):
@@ -129,16 +187,16 @@ class SelfAttention2d(ConditionedModule):
         self.qkv_proj = nn.Conv2d(c_in, c_in * 3, 1)
         self.out_proj = nn.Conv2d(c_in, c_in, 1)
         self.dropout = nn.Dropout(dropout_rate)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, input, cond):
         n, c, h, w = input.shape
         qkv = self.qkv_proj(self.norm_in(input, cond))
         qkv = qkv.view([n, self.n_head * 3, c // self.n_head, h * w]).transpose(2, 3)
         q, k, v = qkv.chunk(3, dim=1)
-        scale = k.shape[3] ** -0.25
-        att = ((q * scale) @ (k.transpose(2, 3) * scale)).softmax(3)
-        att = self.dropout(att)
-        y = (att @ v).transpose(2, 3).contiguous().view([n, c, h, w])
+        y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p)
+        y = y.transpose(2, 3).contiguous().view([n, c, h, w])
         return input + self.out_proj(y)
 
 
@@ -156,6 +214,8 @@ class CrossAttention2d(ConditionedModule):
         self.kv_proj = nn.Linear(c_enc, c_dec * 2)
         self.out_proj = nn.Conv2d(c_dec, c_dec, 1)
         self.dropout = nn.Dropout(dropout_rate)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, input, cond):
         n, c, h, w = input.shape
@@ -164,13 +224,9 @@ class CrossAttention2d(ConditionedModule):
         kv = self.kv_proj(self.norm_enc(cond[self.cond_key]))
         kv = kv.view([n, -1, self.n_head * 2, c // self.n_head]).transpose(1, 2)
         k, v = kv.chunk(2, dim=1)
-        scale = k.shape[3] ** -0.25
-        att = ((q * scale) @ (k.transpose(2, 3) * scale))
-        att = att - (cond[self.cond_key_padding][:, None, None, :]) * 10000
-        att = att.softmax(3)
-        att = self.dropout(att)
-        y = (att @ v).transpose(2, 3)
-        y = y.contiguous().view([n, c, h, w])
+        attn_mask = (cond[self.cond_key_padding][:, None, None, :]) * -10000
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p=self.dropout.p)
+        y = y.transpose(2, 3).contiguous().view([n, c, h, w])
         return input + self.out_proj(y)
 
 

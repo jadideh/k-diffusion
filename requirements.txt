@@ -1,14 +1,15 @@
 accelerate
 clean-fid
 clip-anytorch
+dctorch
 einops
 jsonmerge
 kornia
 Pillow
-resize-right
+safetensors
 scikit-image
 scipy
-torch
+torch>=2.1
 torchdiffeq
 torchsde
 torchvision
